@@ -1,0 +1,72 @@
+name: ALP Attendance CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.8.4
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -v --cov=app --cov-report=term-missing --cov-fail-under=90
+
+  build-and-smoke-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t alp-attendance:${{ github.sha }} .
+      - name: Run container and hit /health
+        run: |
+          docker run -d --name alp -p 8000:8000 alp-attendance:${{ github.sha }}
+          for i in $(seq 1 15); do
+            if curl -fs http://localhost:8000/health; then echo; echo "Smoke test passed"; exit 0; fi
+            sleep 2
+          done
+          docker logs alp; exit 1
+
+  deliver:
+    # Continuous delivery: only on main, only after every earlier job passes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image to GitHub Container Registry
+        run: |
+          IMAGE=ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          docker build -t $IMAGE:latest -t $IMAGE:${{ github.sha }} .
+          docker push $IMAGE --all-tags
